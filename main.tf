@@ -111,7 +111,7 @@ data "aws_subnet_ids" "default" {
 resource "aws_instance" "db" {
   ami                         = var.ubuntu_ami
   instance_type               = var.instance_type
-  subnet_id                   = element(data.aws_subnet_ids.default.ids, 0)
+  subnet_id = data.aws_subnets.default.ids[0]
   vpc_security_group_ids      = [aws_security_group.db_sg.id]
   key_name                    = var.key_name
   associate_public_ip_address = true
@@ -160,7 +160,7 @@ resource "aws_instance" "db" {
 resource "aws_instance" "app" {
   ami                         = var.ubuntu_ami
   instance_type               = var.instance_type
-  subnet_id                   = element(data.aws_subnet_ids.default.ids, 0)
+  subnet_id = data.aws_subnets.default.ids[0]
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
   key_name                    = var.key_name
   associate_public_ip_address = true
