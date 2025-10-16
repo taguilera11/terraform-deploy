@@ -1,6 +1,6 @@
-##############################
+########################################
 # Terraform + Provider
-##############################
+########################################
 terraform {
   required_version = ">= 1.5.0"
   required_providers {
@@ -15,26 +15,26 @@ provider "aws" {
   region = var.aws_region
 }
 
-##############################
+########################################
 # Variables
-##############################
+########################################
 variable "aws_region"    { default = "us-east-1" }
 variable "project_name"  { default = "sprint2" }
 variable "instance_type" { default = "t2.nano" } # sube para DB si necesitas
 variable "git_repo_url"  { default = "https://github.com/SSUAREZD/ProyectoArquisoftHermonitos.git" }
 variable "git_branch"    { default = "vm-deploy" }
 
-# DB creds (cámbialos)
+# Credenciales DB
 variable "db_name"       { default = "proyecto_arquisoft" }
 variable "db_user"       { default = "django" }
 variable "db_password"   { default = "sprint2" }
 
-# ALLOWED_HOSTS para Django
+# ALLOWED_HOSTS para Django (puede ser * o la IP/dominio)
 variable "allowed_hosts" { default = "*" }
 
-##############################
+########################################
 # Datos: VPC / Subnets / AMI Ubuntu 24.04
-##############################
+########################################
 data "aws_vpc" "default" {
   default = true
 }
@@ -46,7 +46,7 @@ data "aws_subnets" "default" {
   }
 }
 
-# Canonical Ubuntu 24.04 LTS AMI
+# Canonical Ubuntu 24.04 LTS (Noble)
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
@@ -56,9 +56,9 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-##############################
+########################################
 # Security Groups
-##############################
+########################################
 # App: HTTP/HTTPS abiertos (sin SSH)
 resource "aws_security_group" "app_sg" {
   name        = "${var.project_name}-app-sg"
@@ -72,6 +72,7 @@ resource "aws_security_group" "app_sg" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   ingress {
     description = "HTTPS"
     from_port   = 443
@@ -79,6 +80,7 @@ resource "aws_security_group" "app_sg" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
   egress {
     description = "All egress"
     from_port   = 0
@@ -103,6 +105,7 @@ resource "aws_security_group" "db_sg" {
     protocol        = "tcp"
     security_groups = [aws_security_group.app_sg.id]
   }
+
   egress {
     description = "All egress"
     from_port   = 0
@@ -114,9 +117,9 @@ resource "aws_security_group" "db_sg" {
   tags = { Name = "${var.project_name}-db-sg" }
 }
 
-##############################
+########################################
 # IAM para SSM (sin key pair / sin SSH)
-##############################
+########################################
 resource "aws_iam_role" "ssm_role" {
   name = "${var.project_name}-ssm-role"
   assume_role_policy = jsonencode({
@@ -139,9 +142,9 @@ resource "aws_iam_instance_profile" "ssm_profile" {
   role = aws_iam_role.ssm_role.name
 }
 
-##############################
+########################################
 # EC2: Base de Datos (PostgreSQL)
-##############################
+########################################
 resource "aws_instance" "db" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
@@ -153,19 +156,19 @@ resource "aws_instance" "db" {
   user_data = <<-EOF
     #!/bin/bash
     set -eux
-
     export DEBIAN_FRONTEND=noninteractive
+
     apt-get update -y
     apt-get install -y postgresql postgresql-contrib
 
-    # Localiza archivos de configuración (14/15/16)
+    # Detecta rutas (14/15/16)
     PGCONF=$(ls /etc/postgresql/*/main/postgresql.conf | head -n1)
     PHBA=$(ls /etc/postgresql/*/main/pg_hba.conf | head -n1)
 
     # Escuchar en todas las interfaces
     sed -i "s/^#*listen_addresses.*/listen_addresses = '*'/" "$PGCONF"
 
-    # Permitir clientes por md5 (ajusta a tu CIDR si prefieres restringir)
+    # Permitir clientes por md5 (restringe a tu CIDR si quieres)
     echo "host    all             all             0.0.0.0/0               md5" >> "$PHBA"
 
     systemctl restart postgresql
@@ -186,9 +189,9 @@ resource "aws_instance" "db" {
   tags = { Name = "${var.project_name}-db" }
 }
 
-##############################
+########################################
 # EC2: App (Nginx + Gunicorn + Django + Redis)
-##############################
+########################################
 resource "aws_instance" "app" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
@@ -197,7 +200,6 @@ resource "aws_instance" "app" {
   associate_public_ip_address = true
   iam_instance_profile        = aws_iam_instance_profile.ssm_profile.name
 
-  # IMPORTANTE: ajusta REPO/BRANCH si cambian
   user_data = <<-EOF
     #!/bin/bash
     set -eux
@@ -211,7 +213,6 @@ resource "aws_instance" "app" {
     APP_DIR="/srv/ProyectoArquisoftHermonitos"
     REPO_URL="${var.git_repo_url}"
     REPO_BRANCH="${var.git_branch}"
-    DB_HOST_IP="${aws_instance.db.private_ip}"
 
     mkdir -p "$APP_DIR"
     cd "$APP_DIR"
@@ -236,7 +237,7 @@ resource "aws_instance" "app" {
     DB_NAME=${var.db_name}
     DB_USER=${var.db_user}
     DB_PASSWORD=${var.db_password}
-    DB_HOST=${DB_HOST_IP}
+    DB_HOST=${aws_instance.db.private_ip}
     DB_PORT=5432
 
     REDIS_URL=redis://127.0.0.1:6379/1
@@ -299,9 +300,9 @@ resource "aws_instance" "app" {
   tags = { Name = "${var.project_name}-app" }
 }
 
-##############################
+########################################
 # Outputs
-##############################
+########################################
 output "app_public_ip" {
   value       = aws_instance.app.public_ip
   description = "IP pública de la APP (Nginx)."
