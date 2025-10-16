@@ -1,26 +1,14 @@
 ##############################
-# VARIABLES (ajusta a tu gusto)
+# Terraform + Provider
 ##############################
-variable "aws_region"    { default = "us-east-1" }
-variable "key_name"      { default = "mi-keypair" } # EXISTENTE en tu cuenta
-variable "instance_type" { default = "t2.nano" }    # app y db; sube en db si quieres
-variable "project_name"  { default = "sprint2" }
-
-# Repo de tu app
-variable "git_repo_url"  { default = "https://github.com/SSUAREZD/ProyectoArquisoftHermonitos.git" }
-variable "git_branch"    { default = "vm-deploy" }
-
-# Credenciales DB
-variable "db_name"       { default = "proyecto_arquisoft" }
-variable "db_user"       { default = "django" }
-variable "db_password"   { default = "sprint2" }    # cámbiala!
-
-# Dominio/IP (para ALLOWED_HOSTS). Usa * si no tienes dominio aún.
-variable "allowed_hosts" { default = "*" }
-
-# AMI Ubuntu 24.04 LTS (HVM) en us-east-1. Cambia si usas otra región.
-variable "ubuntu_ami" {
-  default = "ami-0e86e20dae9224db8"
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
 }
 
 provider "aws" {
@@ -28,12 +16,53 @@ provider "aws" {
 }
 
 ##############################
-# SECURITY GROUPS
+# Variables
 ##############################
-# SG de la APP: HTTP/HTTPS abiertos al mundo (y SSH opcional desde tu IP)
+variable "aws_region"    { default = "us-east-1" }
+variable "project_name"  { default = "sprint2" }
+variable "instance_type" { default = "t2.nano" } # sube para DB si necesitas
+variable "git_repo_url"  { default = "https://github.com/SSUAREZD/ProyectoArquisoftHermonitos.git" }
+variable "git_branch"    { default = "vm-deploy" }
+
+# DB creds (cámbialos)
+variable "db_name"       { default = "proyecto_arquisoft" }
+variable "db_user"       { default = "django" }
+variable "db_password"   { default = "sprint2" }
+
+# ALLOWED_HOSTS para Django
+variable "allowed_hosts" { default = "*" }
+
+##############################
+# Datos: VPC / Subnets / AMI Ubuntu 24.04
+##############################
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
+
+# Canonical Ubuntu 24.04 LTS AMI
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
+  }
+}
+
+##############################
+# Security Groups
+##############################
+# App: HTTP/HTTPS abiertos (sin SSH)
 resource "aws_security_group" "app_sg" {
   name        = "${var.project_name}-app-sg"
-  description = "SG for app (Nginx, Docker)"
+  description = "SG for app (Nginx)"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -50,14 +79,6 @@ resource "aws_security_group" "app_sg" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
-  # SSH (opcional). Cambia tu IP pública aquí o elimina esta regla.
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
   egress {
     description = "All egress"
     from_port   = 0
@@ -65,9 +86,11 @@ resource "aws_security_group" "app_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = { Name = "${var.project_name}-app-sg" }
 }
 
-# SG de la DB: solo acepta 5432 desde el SG de la APP
+# DB: 5432 solo desde app_sg
 resource "aws_security_group" "db_sg" {
   name        = "${var.project_name}-db-sg"
   description = "SG for PostgreSQL"
@@ -80,14 +103,6 @@ resource "aws_security_group" "db_sg" {
     protocol        = "tcp"
     security_groups = [aws_security_group.app_sg.id]
   }
-  # SSH opcional a DB (si quieres entrar a administrarla). Elimínalo si no lo necesitas.
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
   egress {
     description = "All egress"
     from_port   = 0
@@ -95,57 +110,68 @@ resource "aws_security_group" "db_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
-}
 
-data "aws_vpc" "default" {
-  default = true
+  tags = { Name = "${var.project_name}-db-sg" }
 }
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-}
-
 
 ##############################
-# EC2: BASE DE DATOS (PostgreSQL)
+# IAM para SSM (sin key pair / sin SSH)
+##############################
+resource "aws_iam_role" "ssm_role" {
+  name = "${var.project_name}-ssm-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect    = "Allow",
+      Principal = { Service = "ec2.amazonaws.com" },
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ssm_profile" {
+  name = "${var.project_name}-ssm-profile"
+  role = aws_iam_role.ssm_role.name
+}
+
+##############################
+# EC2: Base de Datos (PostgreSQL)
 ##############################
 resource "aws_instance" "db" {
-  ami                         = var.ubuntu_ami
+  ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
-  subnet_id = data.aws_subnets.default.ids[0]
+  subnet_id                   = data.aws_subnets.default.ids[0]
   vpc_security_group_ids      = [aws_security_group.db_sg.id]
-  key_name                    = var.key_name
   associate_public_ip_address = true
-
-  tags = {
-    Name = "${var.project_name}-db"
-  }
+  iam_instance_profile        = aws_iam_instance_profile.ssm_profile.name
 
   user_data = <<-EOF
     #!/bin/bash
     set -eux
+
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
     apt-get install -y postgresql postgresql-contrib
 
-    # Asegura que Postgres acepte conexiones
-    PGCONF="/etc/postgresql/16/main/postgresql.conf"
-    PHBA="/etc/postgresql/16/main/pg_hba.conf"
-    if [ ! -f "$PGCONF" ]; then
-      # fallback versión (Ubuntu podría tener 14/15/16)
-      PGCONF=$(ls /etc/postgresql/*/main/postgresql.conf | head -n1)
-      PHBA=$(ls /etc/postgresql/*/main/pg_hba.conf | head -n1)
-    fi
+    # Localiza archivos de configuración (14/15/16)
+    PGCONF=$(ls /etc/postgresql/*/main/postgresql.conf | head -n1)
+    PHBA=$(ls /etc/postgresql/*/main/pg_hba.conf | head -n1)
 
+    # Escuchar en todas las interfaces
     sed -i "s/^#*listen_addresses.*/listen_addresses = '*'/" "$PGCONF"
-    # Permite md5 desde la VPC (ajusta el CIDR si quieres ser más estricto)
+
+    # Permitir clientes por md5 (ajusta a tu CIDR si prefieres restringir)
     echo "host    all             all             0.0.0.0/0               md5" >> "$PHBA"
 
     systemctl restart postgresql
+    systemctl enable postgresql
 
-    # Crea DB y usuario
+    # Crear usuario/DB si no existen
     sudo -u postgres psql -c "DO $$
     BEGIN
       IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${var.db_user}') THEN
@@ -156,42 +182,52 @@ resource "aws_instance" "db" {
     sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '${var.db_name}'" | grep -q 1 || \
       sudo -u postgres createdb -O ${var.db_user} ${var.db_name}
   EOF
+
+  tags = { Name = "${var.project_name}-db" }
 }
 
 ##############################
-# EC2: APP (Nginx + Gunicorn + Django + Redis con Docker)
+# EC2: App (Nginx + Gunicorn + Django + Redis)
 ##############################
 resource "aws_instance" "app" {
-  ami                         = var.ubuntu_ami
+  ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
-  subnet_id = data.aws_subnets.default.ids[0]
+  subnet_id                   = data.aws_subnets.default.ids[0]
   vpc_security_group_ids      = [aws_security_group.app_sg.id]
-  key_name                    = var.key_name
   associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.ssm_profile.name
 
-  tags = {
-    Name = "${var.project_name}-app"
-  }
-
+  # IMPORTANTE: ajusta REPO/BRANCH si cambian
   user_data = <<-EOF
     #!/bin/bash
     set -eux
+    export DEBIAN_FRONTEND=noninteractive
 
     apt-get update -y
-    apt-get install -y docker.io docker-compose-plugin git
+    apt-get install -y python3-venv python3-pip git nginx redis-server
 
-    systemctl enable --now docker
+    systemctl enable --now redis-server
 
-    # Carpeta de despliegue
-    mkdir -p /srv/app && cd /srv/app
+    APP_DIR="/srv/ProyectoArquisoftHermonitos"
+    REPO_URL="${var.git_repo_url}"
+    REPO_BRANCH="${var.git_branch}"
+    DB_HOST_IP="${aws_instance.db.private_ip}"
 
-    # Clona el repo
-    git clone ${var.git_repo_url} repo
-    cd repo
+    mkdir -p "$APP_DIR"
+    cd "$APP_DIR"
+
+    if [ ! -d ".git" ]; then
+      git clone "$REPO_URL" .
+    fi
     git fetch --all
-    git checkout ${var.git_branch}
+    git checkout "$REPO_BRANCH"
+    git pull --ff-only
 
-    # Escribe .env para Django (app -> usa DB privada)
+    python3 -m venv venv
+    . venv/bin/activate
+    pip install --upgrade pip
+    pip install -r requirements.txt
+
     cat > .env <<ENV
     DJANGO_DEBUG=False
     DJANGO_SECRET_KEY=sprint2
@@ -200,113 +236,78 @@ resource "aws_instance" "app" {
     DB_NAME=${var.db_name}
     DB_USER=${var.db_user}
     DB_PASSWORD=${var.db_password}
-    DB_HOST=${aws_instance.db.private_ip}
+    DB_HOST=${DB_HOST_IP}
     DB_PORT=5432
 
-    REDIS_URL=redis://redis:6379/1
+    REDIS_URL=redis://127.0.0.1:6379/1
     ENV
 
-    # Dockerfile para web (Django + Gunicorn)
-    cat > Dockerfile <<'DOCKER'
-    FROM python:3.12-slim
+    # Migraciones
+    python manage.py migrate
 
-    WORKDIR /app
-    ENV PYTHONDONTWRITEBYTECODE=1
-    ENV PYTHONUNBUFFERED=1
+    # Gunicorn como servicio
+    cat >/etc/systemd/system/gunicorn.service <<'UNIT'
+    [Unit]
+    Description=gunicorn daemon for ProyectoArquisoft
+    After=network.target
 
-    RUN apt-get update && apt-get install -y build-essential libpq-dev && rm -rf /var/lib/apt/lists/*
+    [Service]
+    User=ubuntu
+    Group=www-data
+    WorkingDirectory=/srv/ProyectoArquisoftHermonitos
+    Environment="PATH=/srv/ProyectoArquisoftHermonitos/venv/bin"
+    ExecStart=/srv/ProyectoArquisoftHermonitos/venv/bin/gunicorn \
+      --workers 2 \
+      --bind unix:/srv/ProyectoArquisoftHermonitos/gunicorn.sock \
+      proyectoArquisoft.wsgi:application
+    Restart=always
 
-    COPY requirements.txt /app/requirements.txt
-    RUN pip install --no-cache-dir -r requirements.txt
+    [Install]
+    WantedBy=multi-user.target
+    UNIT
 
-    COPY . /app
+    systemctl daemon-reload
+    systemctl enable --now gunicorn
 
-    # Collect static si lo usas en el futuro:
-    # RUN python manage.py collectstatic --noinput || true
-
-    # Gunicorn
-    CMD ["gunicorn", "--bind", "0.0.0.0:8000", "proyectoArquisoft.wsgi:application", "--workers", "2"]
-    DOCKER
-
-    # Nginx conf (reverse proxy a web:8000)
-    mkdir -p nginx
-    cat > nginx/default.conf <<'NGINX'
+    # Nginx reverse proxy
+    cat >/etc/nginx/sites-available/proyecto <<'NGINX'
     server {
-      listen 80;
-      server_name _;
+        listen 80;
+        server_name _;
 
-      # Estáticos futuros:
-      # location /static/ {
-      #   alias /static/;
-      # }
+        # Estáticos (si más adelante usas collectstatic)
+        # location /static/ {
+        #     alias /srv/ProyectoArquisoftHermonitos/static/;
+        # }
 
-      location / {
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_pass http://web:8000;
-      }
+        location / {
+            include proxy_params;
+            proxy_pass http://unix:/srv/ProyectoArquisoftHermonitos/gunicorn.sock;
+        }
     }
     NGINX
 
-    # docker-compose
-    cat > docker-compose.yml <<'COMPOSE'
-    services:
-      web:
-        build: .
-        env_file: .env
-        depends_on:
-          - redis
-        ports:
-          - "8000:8000"   # expuesto solo interno de compose; Nginx atenderá 80
-        networks:
-          - appnet
-
-      redis:
-        image: redis:7-alpine
-        command: ["redis-server", "--appendonly", "yes"]
-        networks:
-          - appnet
-
-      nginx:
-        image: nginx:alpine
-        ports:
-          - "80:80"
-        volumes:
-          - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-          # - ./static:/static:ro
-        depends_on:
-          - web
-        networks:
-          - appnet
-
-    networks:
-      appnet:
-        driver: bridge
-    COMPOSE
-
-    # Instala dependencias y migra (usando contenedor web)
-    docker compose build
-    docker compose up -d
-
-    # Espera a que web esté arriba y migra/crea superuser opcionalmente
-    sleep 8
-    docker compose exec -T web python manage.py migrate
-    # (opcional) crear superusuario:
-    # docker compose exec -T web python manage.py createsuperuser --noinput --username admin --email admin@example.com || true
-
-    # Listo: Nginx en :80 sirve la app (proxy a web:8000), Redis en red interna.
+    ln -sf /etc/nginx/sites-available/proyecto /etc/nginx/sites-enabled/proyecto
+    rm -f /etc/nginx/sites-enabled/default
+    nginx -t
+    systemctl reload nginx
+    systemctl enable nginx
   EOF
+
+  depends_on = [aws_instance.db]
+
+  tags = { Name = "${var.project_name}-app" }
 }
 
 ##############################
-# OUTPUTS
+# Outputs
 ##############################
 output "app_public_ip" {
-  value = aws_instance.app.public_ip
+  value       = aws_instance.app.public_ip
+  description = "IP pública de la APP (Nginx)."
 }
 
 output "db_private_ip" {
-  value = aws_instance.db.private_ip
+  value       = aws_instance.db.private_ip
+  description = "IP privada de la DB (PostgreSQL)."
 }
